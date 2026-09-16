@@ -1217,24 +1217,23 @@ impl BytesMut {
         }
     }
 
-    /// Extends the buffer from an `IntoIterator<Item = u8>`.
+    /// Appends bytes from `iter` into the spare capacity, without growing.
+    ///
+    /// Goes through `Vec::extend`, which carries std's `TrustedLen`
+    /// specialization (slice-like iterators become a memcpy).
     ///
     /// # SAFETY
     ///
     /// The caller must ensure that `self.kind()` is `KIND_VEC`.
-    unsafe fn extend_vec<I: IntoIterator<Item = u8>>(&mut self, iter: I) {
+    #[inline(always)]
+    unsafe fn extend_vec<I: Iterator<Item = u8>>(&mut self, iter: I) {
         debug_assert_eq!(self.kind(), KIND_VEC);
 
         let off = self.get_vec_pos();
-        let vec = ManuallyDrop::new(rebuild_vec(self.ptr.as_ptr(), self.len, self.cap, off));
-
-        let mut guard = VecRebuildGuard {
-            bytes: self,
-            vec,
-            off,
-        };
-
-        guard.vec.extend(iter);
+        let spare = self.cap - self.len;
+        let mut vec = ManuallyDrop::new(rebuild_vec(self.ptr.as_ptr(), self.len, self.cap, off));
+        vec.extend(iter.take(spare));
+        self.len = vec.len() - off;
     }
 }
 
@@ -1506,17 +1505,17 @@ impl Extend<u8> for BytesMut {
     where
         T: IntoIterator<Item = u8>,
     {
-        let iter = iter.into_iter();
+        let mut iter = iter.into_iter();
 
         let (lower, _) = iter.size_hint();
         self.reserve(lower);
 
         if self.kind() == KIND_VEC {
-            unsafe { self.extend_vec(iter) };
-        } else {
-            for b in iter {
-                self.put_u8(b);
-            }
+            unsafe { self.extend_vec(&mut iter) };
+        }
+
+        for b in iter {
+            self.put_u8(b);
         }
     }
 }
@@ -1907,26 +1906,6 @@ unsafe fn rebuild_vec(ptr: *mut u8, mut len: usize, mut cap: usize, off: usize) 
     cap += off;
 
     Vec::from_raw_parts(ptr, len, cap)
-}
-
-/// RAII guard in case the extension panics and is caught before
-/// we update the state.
-///
-/// On drop - updates the `BytesMut` len, cap and ptr.
-struct VecRebuildGuard<'a> {
-    bytes: &'a mut BytesMut,
-    vec: ManuallyDrop<Vec<u8>>,
-    off: usize,
-}
-
-impl Drop for VecRebuildGuard<'_> {
-    fn drop(&mut self) {
-        unsafe {
-            self.bytes.len = self.vec.len() - self.off;
-            self.bytes.cap = self.vec.capacity() - self.off;
-            self.bytes.ptr = vptr(self.vec.as_mut_ptr().add(self.off));
-        }
-    }
 }
 
 // ===== impl SharedVtable =====
